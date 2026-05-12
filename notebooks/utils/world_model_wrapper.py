@@ -100,7 +100,7 @@ class WorldModel(object):
             goal_frame=goal_rep_4d,
             world_model=step_predictor,
             rollout=1,
-            steps=50,
+            steps=100,
             step_size=0.01,
             maxnorm=0.15,
             objective=l1,
