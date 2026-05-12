@@ -162,6 +162,284 @@ def cem(
 
     return new_action
 
+def gradient_descent(
+    context_frame,
+    context_pose,
+    goal_frame,
+    world_model,
+    rollout=1,
+    steps=100,
+    step_size=0.01,
+    maxnorm=0.05,
+    objective=l1,
+    a_warmstart=None,
+    optimize_gripper=False,
+    action_l2=0.0,
+    prior_l2=0.0,
+    verbose=False,
+):
+    """
+    Gradient-based action optimization.
+
+    This is a differentiable alternative to CEM. Instead of sampling many
+    action trajectories, we directly optimize the action trajectory by
+    backpropagating the latent prediction loss into the action variables.
+
+    The optimized compact action is:
+
+        u_h = [dx, dy, dz, dg]              shape [B, rollout, 4]
+
+    and it is expanded into the full 7D robot action:
+
+        a_h = [dx, dy, dz, 0, 0, 0, dg]    shape [B, rollout, 7]
+
+    Rotation deltas are fixed to zero, matching the original CEM planner.
+
+    Objective:
+
+        loss =
+            latent_loss
+            + action_l2 * ||a_xyz||^2
+            + prior_l2  * ||a_xyz - a_warmstart_xyz||^2
+
+    For diagnostic experiments, prior_l2 is the useful one: it discourages
+    the optimized action from drifting far away from the warm start.
+    """
+
+    device = context_frame.device
+    dtype = context_frame.dtype
+
+    B = context_frame.size(0)
+    assert B == 1, "This simple planner currently assumes B=1, matching the CEM notebook setup."
+
+    def normalize_warmstart(a):
+        """
+        Accept warmstart as list, np.ndarray, or torch.Tensor.
+
+        Expected shapes:
+            [7]
+            [4]
+            [rollout, 7]
+            [rollout, 4]
+            [1, rollout, 7]
+            [1, rollout, 4]
+        """
+        if a is None:
+            return None
+
+        if not torch.is_tensor(a):
+            a = torch.tensor(a, device=device, dtype=dtype)
+        else:
+            a = a.to(device=device, dtype=dtype)
+
+        if a.ndim == 1:
+            # [7] or [4] -> [1, 1, 7] or [1, 1, 4]
+            a = a.view(1, 1, -1)
+        elif a.ndim == 2:
+            # [rollout, 7] or [rollout, 4] -> [1, rollout, 7] or [1, rollout, 4]
+            a = a.unsqueeze(0)
+        elif a.ndim == 3:
+            pass
+        else:
+            raise ValueError(f"a_warmstart must have ndim 1, 2, or 3, got shape {a.shape}")
+
+        if a.shape[0] != B:
+            raise ValueError(f"a_warmstart batch size {a.shape[0]} does not match B={B}")
+
+        if a.shape[1] != rollout:
+            if a.shape[1] == 1 and rollout > 1:
+                # Repeat a single warm-start action across the rollout horizon.
+                a = a.repeat(1, rollout, 1)
+            else:
+                raise ValueError(
+                    f"a_warmstart rollout length {a.shape[1]} does not match rollout={rollout}"
+                )
+
+        if a.shape[-1] not in (4, 7):
+            raise ValueError(
+                f"a_warmstart must have last dimension 4 or 7, got shape {a.shape}"
+            )
+
+        return a
+
+    def compact_to_full_action(v_compact):
+        """
+        Convert unconstrained compact variable v into a full bounded 7D action.
+
+        v_compact: [B, rollout, 4]
+        returns:   [B, rollout, 7]
+        """
+        xyz = maxnorm * torch.tanh(v_compact[..., :3])
+
+        if optimize_gripper:
+            gripper = 0.75 * torch.tanh(v_compact[..., -1:])
+        else:
+            gripper = torch.zeros_like(v_compact[..., -1:])
+
+        zeros_rot = torch.zeros(
+            (*v_compact.shape[:-1], 3),
+            device=v_compact.device,
+            dtype=v_compact.dtype,
+        )
+
+        full_action = torch.cat([xyz, zeros_rot, gripper], dim=-1)
+        return full_action
+
+    # ------------------------------------------------------------------
+    # Build initialization and prior action.
+    # ------------------------------------------------------------------
+
+    a_warmstart = normalize_warmstart(a_warmstart)
+
+    if a_warmstart is None:
+        u_init = torch.zeros((B, rollout, 4), device=device, dtype=dtype)
+        a_prior_full = None
+    else:
+        if a_warmstart.shape[-1] == 7:
+            # Convert full action [dx, dy, dz, droll, dpitch, dyaw, dg]
+            # into compact action [dx, dy, dz, dg].
+            u_init = torch.cat(
+                [a_warmstart[..., :3], a_warmstart[..., -1:]],
+                dim=-1,
+            )
+
+            # The planner fixes rotation deltas to zero, so the prior should
+            # match the action family being optimized.
+            zeros_rot = torch.zeros(
+                (*u_init.shape[:-1], 3),
+                device=device,
+                dtype=dtype,
+            )
+            a_prior_full = torch.cat(
+                [u_init[..., :3], zeros_rot, u_init[..., -1:]],
+                dim=-1,
+            )
+        else:
+            # Compact action [dx, dy, dz, dg].
+            u_init = a_warmstart
+
+            zeros_rot = torch.zeros(
+                (*u_init.shape[:-1], 3),
+                device=device,
+                dtype=dtype,
+            )
+            a_prior_full = torch.cat(
+                [u_init[..., :3], zeros_rot, u_init[..., -1:]],
+                dim=-1,
+            )
+
+    # ------------------------------------------------------------------
+    # Use unconstrained parameter v and map to bounded actions using tanh.
+    #
+    #   xyz = maxnorm * tanh(v_xyz)
+    #   g   = 0.75    * tanh(v_g)
+    #
+    # This avoids hard clipping inside the optimizer.
+    # ------------------------------------------------------------------
+
+    eps = 1e-6
+
+    xyz0 = torch.clamp(u_init[..., :3] / maxnorm, -1.0 + eps, 1.0 - eps)
+    v_xyz0 = torch.atanh(xyz0)
+
+    if optimize_gripper:
+        g0 = torch.clamp(u_init[..., -1:] / 0.75, -1.0 + eps, 1.0 - eps)
+        v_g0 = torch.atanh(g0)
+    else:
+        v_g0 = torch.zeros((B, rollout, 1), device=device, dtype=dtype)
+
+    v = torch.cat([v_xyz0, v_g0], dim=-1).detach().clone()
+    v.requires_grad_(True)
+
+    optimizer = torch.optim.Adam([v], lr=step_size)
+
+    best_loss = float("inf")
+    best_action = None
+
+    # Detach fixed inputs so gradients are only used to optimize action.
+    context_frame = context_frame.detach()
+    context_pose = context_pose.detach()
+    goal_frame = goal_frame.detach()
+
+    for step in range(steps):
+        optimizer.zero_grad(set_to_none=True)
+
+        action_traj = compact_to_full_action(v)
+
+        # --------------------------------------------------------------
+        # Roll out the world model.
+        #
+        # frame_traj starts as [B, 1, HW, D]
+        # pose_traj starts as [B, 1, 7]
+        #
+        # At each step h:
+        #   actions_so_far = [a_0, ..., a_h]
+        #   next_frame, next_pose = world_model(frame_traj, actions_so_far, pose_traj)
+        # --------------------------------------------------------------
+
+        frame_traj = context_frame
+        pose_traj = context_pose
+
+        for h in range(rollout):
+            actions_so_far = action_traj[:, : h + 1]
+
+            next_frame, next_pose = world_model(
+                frame_traj,
+                actions_so_far,
+                pose_traj,
+            )
+
+            frame_traj = torch.cat([frame_traj, next_frame], dim=1)
+            pose_traj = torch.cat([pose_traj, next_pose], dim=1)
+
+        final_frame = frame_traj[:, -1]
+
+        # --------------------------------------------------------------
+        # Loss components.
+        # --------------------------------------------------------------
+
+        latent_loss_vec = objective(final_frame.flatten(1), goal_frame.flatten(1))
+        latent_loss = latent_loss_vec.mean()
+
+        mag_loss = torch.zeros((), device=device, dtype=dtype)
+        prior_loss = torch.zeros((), device=device, dtype=dtype)
+
+        if action_l2 > 0.0:
+            # Pull action toward zero.
+            mag_loss = (action_traj[..., :3] ** 2).mean()
+
+        if prior_l2 > 0.0 and a_prior_full is not None:
+            # Pull action toward warm-start/prior.
+            #
+            # Only regularize xyz, because this planner fixes rotations to zero
+            # and usually does not optimize gripper.
+            prior_loss = ((action_traj[..., :3] - a_prior_full[..., :3]) ** 2).mean()
+
+        loss = latent_loss + action_l2 * mag_loss + prior_l2 * prior_loss
+
+        loss.backward()
+        optimizer.step()
+
+        loss_value = float(loss.detach().cpu())
+
+        if loss_value < best_loss:
+            best_loss = loss_value
+            best_action = action_traj.detach().clone()
+
+        if verbose and (step % 10 == 0 or step == steps - 1):
+            current_action = action_traj.detach()[0, 0]
+            print(
+                f"[gradient] step {step:04d} "
+                f"total={loss_value:.6f} "
+                f"latent={float(latent_loss.detach().cpu()):.6f} "
+                f"mag={float(mag_loss.detach().cpu()):.6f} "
+                f"prior={float(prior_loss.detach().cpu()):.6f} "
+                f"action_xyz=({current_action[0]:+.4f}, "
+                f"{current_action[1]:+.4f}, "
+                f"{current_action[2]:+.4f})"
+            )
+
+    return best_action
 
 def compute_new_pose(pose, action):
     """

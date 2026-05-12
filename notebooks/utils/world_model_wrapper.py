@@ -6,7 +6,7 @@
 import numpy as np
 import torch.nn.functional as F
 
-from .mpc_utils import cem, compute_new_pose
+from .mpc_utils import cem, compute_new_pose, gradient_descent, l1
 
 
 class WorldModel(object):
@@ -26,6 +26,7 @@ class WorldModel(object):
             "momentum_std": 0.15,
             "maxnorm": 0.05,
             "verbose": True,
+            "warmstart": None,
         },
         normalize_reps=True,
         device="cuda:0",
@@ -73,3 +74,41 @@ class WorldModel(object):
         )[0]
 
         return mpc_action
+        
+    def infer_next_action_gradient(self, rep, pose, goal_rep, close_gripper=None):
+        
+        def step_predictor(reps, actions, poses):
+            B, T, N_T, D = reps.size()
+            reps = reps.flatten(1, 2)
+            next_rep = self.predictor(reps, actions, poses)[:, -self.tokens_per_frame:]
+            if self.normalize_reps:
+                next_rep = F.layer_norm(next_rep, (next_rep.size(-1),))
+            next_rep = next_rep.view(B, 1, N_T, D)
+            # next_pose = compute_new_pose(poses[:, -1:], actions[:, -1:])
+            # return next_rep, next_pose
+                # pose branch is non-differentiable (scipy rotations); detach to break autograd
+            next_pose = compute_new_pose(poses[:, -1:].detach(), actions[:, -1:].detach())
+            return next_rep, next_pose
+
+        # Reshape rep and goal_rep from [B, HW, D] -> [B, 1, HW, D]
+        rep_4d = rep.unsqueeze(1)
+        goal_rep_4d = goal_rep.unsqueeze(1)
+
+        action = gradient_descent(
+            context_frame=rep_4d,
+            context_pose=pose,
+            goal_frame=goal_rep_4d,
+            world_model=step_predictor,
+            rollout=1,
+            steps=50,
+            step_size=0.01,
+            maxnorm=0.15,
+            objective=l1,
+            a_warmstart=self.mpc_args.get("warmstart", None),
+            optimize_gripper=False,
+            action_l2=0.0,
+            prior_l2=10.0,
+            verbose=True,
+        )[0]
+
+        return action
